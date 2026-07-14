@@ -1,0 +1,32 @@
+# STUB — proof that adding a second source is config + a pydantic model, not a code change.
+#
+# This references a fictional second NESO CKAN dataset. To actually enable it,
+# you would:
+#   1. Point resource_id at a real dataset.
+#   2. Add a matching pydantic model in habitat_pipeline.validate.models.
+#   3. Add the corresponding staging table to sql/schema.sql (or accept the
+#      raw-only case documented in the extractor).
+#
+# No changes to any runner would be needed. The core task's own brief flags
+# extensibility ("this may not be the only dataset we ingest from NESO"), and
+# this file exists to demonstrate that the runner is source-agnostic.
+
+name: neso_second_dataset
+extractor: ckan_datastore_sql
+
+extractor_config:
+  base_url: https://api.neso.energy/api/3/action/datastore_search_sql
+  resource_id: 00000000-0000-0000-0000-000000000000   # placeholder; not enabled
+  page_size: 25000
+  incremental_field: _id
+  inter_page_sleep_seconds: 0.2
+  request_timeout_seconds: 30
+
+# Model not implemented; the CLI will refuse to run this source until the model
+# is added. That refusal is the point — it proves the config layer is complete.
+schema_model: habitat_pipeline.validate.models.NesoSecondDatasetPlaceholder
+raw_table: raw.neso_second_dataset
+staging_table: staging.neso_second_dataset
+
+business_key: unit_result_id
+on_reject_threshold: fail

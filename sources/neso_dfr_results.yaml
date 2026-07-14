@@ -1,0 +1,30 @@
+# NESO DFR Auction Results
+# https://www.neso.energy/data-portal/eac-auction-results/neso_response-reserve_results_by_unit
+#
+# Extract cursor: _id (dense monotonic, verified 1..769,077 with no gaps at plan time).
+# Business key:   unit_result_id (verified unique across the dataset).
+
+name: neso_dfr_results
+extractor: ckan_datastore_sql
+
+extractor_config:
+  base_url: https://api.neso.energy/api/3/action/datastore_search_sql
+  resource_id: a63ab354-7e68-44c2-ad96-c6f920c30e85
+  # Verified endpoint tolerates >=500k rows/query; 25k balances memory vs round-trip count.
+  page_size: 25000
+  incremental_field: _id
+  # Politeness — free public API.
+  inter_page_sleep_seconds: 0.2
+  request_timeout_seconds: 30
+
+schema_model: habitat_pipeline.validate.models.NesoDfrResult
+raw_table: raw.neso_dfr_results
+staging_table: staging.neso_dfr_results
+
+# Conflict target for ON CONFLICT DO NOTHING. Deliberately NOT _id — CKAN can
+# re-issue _id on resource reload, which would silently drop rows.
+business_key: unit_result_id
+
+# fail | quarantine | warn. Default fail because loud failure > silent degradation
+# until a source has earned trust.
+on_reject_threshold: fail

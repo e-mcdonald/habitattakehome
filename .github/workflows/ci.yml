@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Mirrors `make lint` + `make typecheck` — run natively, same as a
+  # contributor would locally (no Docker needed for this half).
+  lint-and-typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package + dev deps
+        run: pip install -e ".[dev]"
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Ruff format check
+        run: ruff format --check .
+
+      - name: mypy --strict (src/habitat_pipeline)
+        run: mypy
+
+  # Mirrors `make test` exactly: builds the `test` image (builder stage +
+  # dev extras + full tests/ tree) and runs it against a real, healthchecked
+  # Postgres via docker-compose — including the @pytest.mark.db tests, which
+  # get their own habitat_test database via the `test` service's DATABASE_URL
+  # and a clean_db fixture reset before each test (see NOTES.md §12).
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure env
+        run: cp .env.example .env
+
+      - name: Start Postgres
+        run: docker compose up -d postgres
+
+      - name: Run full test suite (db + non-db)
+        run: docker compose run --rm test -m "db or not db"
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
