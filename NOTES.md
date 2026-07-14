@@ -2,7 +2,7 @@
 
 Author: Ethan McDonald
 
-This document accompanies the code. Its job is to explain **why** the pipeline looks the way it does, cover the decisions I made and the ones I consciously postponed, and pre-answer the questions I expect in the follow-up conversation. If you just want to run it, see [README.md](README.md).
+This document explains **why** the pipeline is built the way it is — the decisions I made, the ones I deliberately put off, and answers to questions I expect to come up in conversation. If you just want to run it, see [README.md](README.md).
 
 ---
 
@@ -14,12 +14,10 @@ This document accompanies the code. Its job is to explain **why** the pipeline l
 flowchart LR
     NESO["NESO CKAN API<br/>datastore_search_sql"]
 
-    subgraph Stages
-        EX["extract"]
-        LD["load_raw"]
-        VA["validate"]
-        TR["transform"]
-    end
+    EX["extract"]
+    LD["load_raw"]
+    VA["validate"]
+    TR["transform"]
 
     JSONL[("landing/*.jsonl")]
     RAW[("raw.neso_dfr_results<br/>JSONB, PK=unit_result_id")]
@@ -30,24 +28,23 @@ flowchart LR
 
     NESO -->|"watermark = raw.max(_id)"| EX
     EX --> JSONL
-    JSONL -->|"COPY + ON CONFLICT<br/>unit_result_id DO NOTHING"| RAW
-    RAW -->|"pydantic validate<br/>anti-join vs staging"| VA
-    VA --> STG
-    STG -->|"001 clean_strings"| STG
-    STG -->|"002 dim_unit upsert"| DIM
-    STG -->|"003 fact_auction_result<br/>grain-asserted upsert"| FACT
+    JSONL --> LD
+    LD -->|"COPY + ON CONFLICT<br/>unit_result_id DO NOTHING"| RAW
+    RAW --> VA
+    VA -->|"pydantic validate<br/>anti-join vs staging"| STG
+    STG --> TR
+    TR -->|"001 clean_strings"| STG
+    TR -->|"002 dim_unit upsert"| DIM
+    TR -->|"003 fact_auction_result<br/>grain-asserted upsert"| FACT
     DIM -.->|"FK auction_unit"| FACT
 
     EX -. run row .-> OPS
     LD -. run row .-> OPS
     VA -. run row + rejects .-> OPS
     TR -. run row .-> OPS
-
-    LD -.-> RAW
-    TR -.-> STG
 ```
 
-Every stage is idempotent and independently re-runnable; there's no separate watermark state file — `raw.max(_id)` is the single source of truth (see §4, §7).
+Every stage is safe to re-run on its own — running it twice doesn't create duplicates or break anything. There's no separate file tracking progress, either: we just ask Postgres for the highest ID we've already loaded (see §4, §7).
 
 ### Component map — which file does what
 
@@ -117,7 +114,7 @@ docker compose run --rm pipeline report
 
 `pipeline`'s image `ENTRYPOINT` is already `habitat-pipeline`, so the subcommand (`migrate`, `run`, ...) follows directly — no need to repeat the binary name. `make` wraps all of the above; see the `Makefile`.
 
-Each stage can be run alone. Every stage is idempotent — safe to re-run:
+Each stage can be run alone. Every stage is safe to re-run:
 
 ```bash
 docker compose run --rm pipeline run --source neso_dfr_results --stage extract
@@ -138,7 +135,7 @@ habitat-pipeline report
 
 ### Tests
 
-Tests run through a dedicated `test` build stage/compose service (`target: test` in `docker-compose.yml`) — it extends the `builder` stage with dev extras and the full `tests/` tree, which the slim `runtime` image intentionally omits.
+Tests run through a dedicated `test` build stage/compose service (`target: test` in `docker-compose.yml`) — it extends the `builder` stage with dev extras and the full `tests/` tree, which the slim `runtime` image intentionally leaves out.
 
 ```bash
 make test
@@ -146,7 +143,7 @@ make test
 docker compose run --rm test -m "db or not db"
 ```
 
-`@pytest.mark.db` tests apply `sql/schema.sql` against a dedicated `habitat_test` database (not whatever the `pipeline` service's `DATABASE_URL` points at), and reset it (`DROP SCHEMA ... CASCADE` + reapply) at the start of each test via the `clean_db` fixture — so results don't depend on, or clobber, an in-progress dev/demo database. Tests with `@pytest.mark.db` skip automatically when `DATABASE_URL` is unset (e.g. running `pytest` locally without Postgres).
+Tests that need a real database (marked `@pytest.mark.db`) run against their own `habitat_test` database — a separate database from whatever the `pipeline` service is pointed at — and it gets wiped and rebuilt before each test via a `clean_db` fixture. That way test results never depend on, or mess up, an in-progress dev/demo database. These tests skip automatically if `DATABASE_URL` isn't set (e.g. running `pytest` locally with no Postgres running).
 
 ---
 
@@ -156,44 +153,42 @@ The core-task brief explicitly says:
 
 > This may not be the only dataset we ingest from NESO, nor is NESO our only ingestion source, so structure your code with that in mind.
 
-I picked the elective that most directly extends that hint. Building a clean `Extractor` + YAML-config abstraction is the same work you'd have to do anyway to satisfy the core task's structural requirement — the elective just makes the abstraction load-bearing rather than aspirational.
+I picked the elective that most directly answers that hint. Building a clean way to plug in new data sources — an `Extractor` interface plus a YAML config file — is work I'd need to do anyway to meet that requirement. The elective just means this part of the design is actually proven, not just claimed.
 
-### Adjacent electives absorbed as byproducts
+### Two other electives came along for free
 
-I want to flag two things I built that overlap with other electives, so it doesn't read as accidental:
+Two other things I built also happen to satisfy other elective groups. Flagging that here so it reads as noticed, not accidental:
 
-- `ops.pipeline_runs`, `ops.rejected_records`, and `ops.freshness` cover **Group B — Data-quality / freshness reporting**. Metrics are stored as data, not just log lines.
-- `marts.dim_unit` and `marts.fact_auction_result` are the **Group A — Data transformation** angle: staging is the schema contract, marts is the analyst-facing shape.
-
-I called these out here rather than pretending they were incidental.
+- `ops.pipeline_runs`, `ops.rejected_records`, and `ops.freshness` cover **Group B — data-quality / freshness reporting**. The numbers live in a table you can query, not just in log lines.
+- `marts.dim_unit` and `marts.fact_auction_result` cover **Group A — data transformation**: staging is the strict, typed layer; marts is the shape an analyst actually wants to query.
 
 ---
 
 ## 3. Storage, model, and library choices
 
-| Layer | Choice | Why | Alternative I considered |
+| Layer | Choice | Why | Alternative |
 |---|---|---|---|
-| Language | Python 3.11 | Habitat's stack; ecosystem fit | — |
-| HTTP | `httpx.Client` (sync) + `tenacity` | Modern client, sensible timeouts, exponential-backoff retries | `requests` — older signal. Async httpx — unnecessary at this row count; saved for a scale-up note |
-| Throttling | Sequential requests + `time.sleep(0.2)` between pages | Polite to a free public API; ~30 pages total; simplest coherent story | Async + semaphore — real gains only if source were throughput-bound |
-| Validation | `pydantic` v2 | Fast, per-record validation, clean valid/rejected split | `pandera` — DataFrame-shaped, not idiomatic for row-level ETL |
-| Storage | Postgres 16 in Docker | Habitat's own stack (matters); JSONB for raw landing; strong types for staging | DuckDB — off-stack; SQLite — no JSONB, weak concurrency |
-| DB driver | `psycopg[binary]` v3 | Native `copy.write_row()` context manager; one less dep than SQLAlchemy | `psycopg[c]` — psycopg's own guidance for prod (compiles against system libpq). `[binary]` chosen for install-simplicity; would move to `[c]` in a production image |
-| Bulk load | `COPY` into temp + `INSERT ... SELECT ... ON CONFLICT DO NOTHING` | 10–50× faster than singleton inserts at 770k rows; `write_row()` auto-escapes tabs (data contains literal `\t\t`) | Text-format COPY with string joins — would corrupt on the tab-in-field DQ issue we already know about |
-| Migrations | `sql/schema.sql` executed via CLI | One-migration take-home doesn't earn Alembic | Alembic — next step when schema starts evolving |
-| Config | `pydantic-settings` + `.env` + per-source YAML | Env for secrets, YAML for readability in review | JSON — noisier |
-| Orchestration | `typer` CLI + `make` (host-side wrapper) | Scope doesn't justify a scheduler; CLI wraps trivially into any orchestrator | Airflow / Prefect / Dagster — over-scope; called out as the next step |
-| Logging | `structlog` (JSON in prod, colored in dev) | Structured, greppable, ready for any sink | stdlib logging — weaker observability story |
-| Testing | `pytest` + `respx` for HTTP; DB tests marked `@pytest.mark.db`, skipped when `DATABASE_URL` unset | Fast core loop; DB tests run inside compose | `testcontainers` — great but eats too much time; the marker pattern is the pragmatic compromise |
-| Packaging | `pyproject.toml` + `uv` (fallback pip) | Modern, lockfile-capable, fast | Poetry — slower, more machinery |
-| Container | Multi-stage `python:3.11-slim` builder + slim runtime; compose with pg healthcheck | Cross-OS reproducibility; small runtime image | Single-stage — bigger image |
-| Lint/format/type | `ruff` + `mypy --strict` on core modules | Fast, single tool for lint+format | Black + Flake8 + isort — three tools where one suffices |
+| Language | Python 3.11 | Habitat's stack | — |
+| HTTP | `httpx` + `tenacity` | Sensible timeouts, built-in retry/backoff | `requests` (older); async (not needed at this volume) |
+| Throttling | Sequential, 0.2s between pages | Polite to a free public API; only ~30 pages | Async + semaphore — worth it only if throughput-bound |
+| Validation | `pydantic` v2 | Per-record validation, clean valid/reject split | `pandera` — DataFrame-shaped, not row-level |
+| Storage | Postgres 16 (Docker) | Habitat's own stack; JSONB for raw, typed columns for staging | DuckDB (off-stack); SQLite (no JSONB) |
+| DB driver | `psycopg[binary]` v3 | Native `COPY`, no ORM overhead | `psycopg[c]` — prod-grade but needs system libpq |
+| Bulk load | `COPY` to temp + `ON CONFLICT DO NOTHING` | 10–50× faster than row-by-row inserts; safely handles literal tabs in the data | Text-format COPY — would corrupt on those same tabs |
+| Migrations | `sql/schema.sql` via CLI | One migration doesn't earn Alembic | Alembic — the next step once schema evolves |
+| Config | `pydantic-settings` + `.env` + YAML | Env for secrets, YAML for readable per-source config | JSON — noisier |
+| Orchestration | `typer` CLI + `make` | Scope doesn't need a scheduler; wraps into one later | Airflow / Prefect / Dagster — over-scope here |
+| Logging | `structlog` | Structured, easy to search; JSON in prod | stdlib logging — weaker observability |
+| Testing | `pytest` + `respx`; DB tests behind a marker | Fast core loop; DB tests still run in CI | `testcontainers` — better, more setup time |
+| Packaging | `pyproject.toml` | Standard, modern | Poetry — more machinery |
+| Container | Multi-stage Docker build | Small runtime image, reproducible across OSes | Single-stage — bigger image |
+| Lint/type | `ruff` + `mypy --strict` | One fast tool instead of three | Black + Flake8 + isort |
 
 ---
 
 ## 4. Data model
 
-Three data schemas (medallion) plus `ops`.
+Three data layers, each cleaner than the last, plus a fourth (`ops`) for tracking pipeline runs:
 
 ```
 raw       ← unvalidated landing (JSONB), conflict target = unit_result_id
@@ -257,38 +252,29 @@ erDiagram
     }
 ```
 
-### Why the split
+### Why split into layers
 
-- **Raw is the legal record.** It holds what the source actually said, byte-for-byte, as JSONB. Never mutated, never filtered. A validation-model bug is a re-validate, not a re-extract.
-- **Staging is the schema contract.** Typed columns, `TRIM`ed strings, UTC timestamps. This is what everything downstream reads.
-- **Marts is analyst-facing.** Cheap to rebuild from staging. Kept minimal deliberately — one dim, one fact.
+- **Raw is the permanent record.** It holds exactly what NESO sent us, untouched — we never edit or delete rows here. If we later find a bug in how we check the data, we can just recheck what's already there instead of downloading it all over again.
+- **Staging is the clean, typed version.** Numbers are numbers, extra whitespace is trimmed, timestamps are all UTC. Everything downstream reads from here.
+- **Marts is built for analysts.** Cheap to rebuild from staging at any time, and kept intentionally simple — one table of units (the assets bidding into the auction — batteries, but also other technology types), one table of results. I skipped a separate table for "participant" since it would have held only one real column of data; it's simpler to keep it as a column on the unit table instead.
 
 ### Why raw is loaded before validation
 
-I chose the load order deliberately as `extract → load raw → validate → transform`, not `extract → validate → load`. If validation gated raw:
+The order is `extract → load raw → validate → transform`, not `extract → validate → load`, for two reasons. First, if a bad row got rejected before it ever reached raw, we'd move past its ID and never see it again — a silent way to lose data. Second, if we ever find a bug in our validation rules, we can just recheck the data we already have instead of downloading it all again. Keeping raw first means "how far have we gotten" always has one simple answer: the highest ID sitting in the raw table.
 
-- A rejected row would advance the watermark past its own `_id` (via successful re-extract next run) — silent data loss unless we tracked rejects separately.
-- Fixing a pydantic-model bug would require re-hitting the API, defeating the point of having a "raw" layer.
+### Why `unit_result_id` is the raw primary key, not `_id`
 
-Loading raw first means the pipeline can be re-validated against fresh model logic offline, and the watermark story is simple (`raw.max(_id)` is the truth).
+CKAN (NESO's data platform) assigns `_id` automatically, and that number can shift if NESO ever reloads the dataset — a known quirk of the platform. If we used `_id` to decide "have we already seen this row," a reload could make us re-import old rows as if they were new, or worse, skip real new ones. `unit_result_id` (e.g. `"2661#||#2710#||#PSR#||#150423"`) is a proper identifier built from the auction itself, so it doesn't change on a reload — I checked it's unique across all 769,077 rows before relying on it. `_id` still sticks around on the raw table, purely to track progress.
 
-### Why `unit_result_id` is the raw PK, not `_id`
+### Why `delivery_start_uk` is a plain `timestamp`, not `timestamptz`
 
-CKAN's `_id` is generated by the datastore on insert. If the resource is dumped and reloaded (a known CKAN quirk), the `_id` sequence can shift. If we used `_id` as the `ON CONFLICT` target, a re-pull after a reload would collide with stale IDs and silently drop rows via `DO NOTHING`.
-
-`unit_result_id` (the composite `"2661#||#2710#||#PSR#||#150423"` value) is durable across reloads. It's verified unique across all 769,077 rows at plan time. That makes it the correct conflict target. `_id` still lives on raw as an indexed column so we can compute the watermark cheaply.
-
-### Why the generated `delivery_start_uk` column is typed `timestamp`, not `timestamptz`
-
-`delivery_start_utc AT TIME ZONE 'Europe/London'` returns a naive `timestamp` — the local wall clock. If I declared the column as `timestamptz`, Postgres would insert an implicit cast that depends on the session TimeZone GUC, which is `STABLE`, not `IMMUTABLE`. Postgres rejects non-`IMMUTABLE` expressions in generated columns and the `CREATE TABLE` would fail. Naive wall-clock is also what an analyst querying "the local time this cleared for" actually wants.
-
-`test_schema_smoke.py` exists partly to catch this class of DDL bug before a reviewer does.
+Converting a UTC timestamp to UK local time in Postgres produces a value with no timezone attached — just a plain date and clock time. That's actually what we want here, since it's what an analyst means by "what time did this clear locally," and declaring the column that way is what makes it work at all: I checked this directly, and declaring the column `timestamptz` instead doesn't get rejected by Postgres — it silently creates the table and silently computes the **wrong** value. The reason: turning that plain local time back into a `timestamptz` requires guessing a timezone, and Postgres does that guess using whatever timezone the connecting session happens to have set — so the same UTC instant would get stored as a different, wrong value depending on who (or what tool) happened to insert it. Declaring the column as a plain `timestamp` sidesteps that guess entirely, since no conversion back is needed. I confirmed this by inserting the same source row under two different session timezones: the plain-`timestamp` version always produced the identical, correct value, while the `timestamptz` version produced two different values for the same input. `test_schema_smoke.py` checks both that the column is generated and that its type is specifically `timestamp` (not `timestamptz`), since Postgres won't stop anyone from silently reintroducing this bug.
 
 ---
 
 ## 5. Observability
 
-Not just log lines — metrics live as data the reviewer can query.
+Not just log lines — the numbers live in tables you can query directly.
 
 ```sql
 -- Run history
@@ -312,129 +298,116 @@ WHERE run_id = (
 GROUP BY reason;
 ```
 
-`ops.freshness` is a view. `ingest_lag = now() - max(ingested_at)` is the real "how stale is our data" signal. `delivery_horizon = max(delivery_start_utc) - now()` is the "how far into the future has the auction cleared" signal — auction results are published for **future** delivery windows, so this is positive under normal operation.
+`ops.freshness` is a live query, not a stored table. `ingest_lag` (now minus the last time we loaded data) is the real "how stale is this" number. `delivery_horizon` (the latest delivery time minus now) tells you how far ahead auctions have already been priced — since NESO publishes results for **future** delivery windows, this should normally be a positive number.
 
 ---
 
 ## 6. Extensibility — how a new source drops in
 
-A `Source` is a YAML config + a pydantic model. The extractor is chosen by name from a registry.
+A `Source` is a YAML config file plus a pydantic model. The extractor is picked by name from a small registry.
 
 **New source, same API family (CKAN):**
 1. Add `sources/<name>.yaml`.
 2. Add a pydantic model to `src/habitat_pipeline/validate/models.py`.
 3. Optionally add a raw/staging table to `sql/schema.sql`.
 
-No runner changes. This is proven by `sources/neso_second_dataset.yaml`, a config-only stub.
+No changes to any runner code. Proven by `sources/neso_second_dataset.yaml`, a config-only stub.
 
 **New source, new API family (e.g. a REST cursor API):**
 1. Subclass `Extractor` in `src/habitat_pipeline/sources/`.
 2. Decorate the class with `@register("your_name")`.
 3. Reference `your_name` from the YAML.
 
-Proven by `src/habitat_pipeline/sources/rest.py` — a `RestApiCursorExtractor` skeleton with a `NotImplementedError` body and a docstring that specifies the YAML shape it would consume. The point of the skeleton is to make the interface concrete without shipping half-working code.
+`src/habitat_pipeline/sources/rest.py` proves this works: it's an unfinished extractor (it raises `NotImplementedError` if you actually try to run it) whose comments spell out exactly what config it would need. The point is to show the interface really fits a non-CKAN source, without shipping code that half-works and might quietly do the wrong thing.
 
 ---
 
 ## 7. Assumptions & evidence
 
-Every assumption below was checked against the live API before I committed to it. Where verification wasn't possible, I say so.
+Every assumption below was checked against the live API before I committed to it. Where I couldn't check something, I say so.
 
 ### Timezone: NESO stores UTC
 
-The `deliveryStart` / `deliveryEnd` fields are ISO strings without a timezone offset. My working assumption is that they are UTC. Evidence:
+NESO's timestamps don't say what timezone they're in. My working assumption: UTC. Evidence — the earliest timestamp in the data is `2026-03-31 22:00`. The UK was on British Summer Time (UTC+1) on that date, so 22:00 UTC equals 23:00 UK time, and 23:00 is the standard start time for these 4-hour scheduling windows. If the timestamps were already in UK local time, that earliest value would read 23:00, not 22:00 — so UTC is the reading that actually lines up.
 
-- `min(deliveryStart) = 2026-03-31 22:00` (naive). GB has been on BST (UTC+1) since 2026-03-29, so 22:00 UTC = 23:00 BST — which is the canonical EFA-block start time. Under a "these are local Europe/London" reading, the minimum would be 23:00, not 22:00.
-- **Limitation:** the current dataset span (2026-03-31 → 2026-07-14) contains no DST boundary, so I can't corroborate against a spring-forward or fall-back day. I would formally confirm against NESO portal metadata before treating this as ironclad.
+**Limitation:** the data I have doesn't cross a clock-change date, so I can't double-check this against a spring-forward or fall-back day. I'd confirm it properly against NESO's own documentation before fully trusting it. Staging stores the UTC version; a second, auto-calculated column gives analysts the UK local-time version too.
 
-The staging column is `delivery_start_utc timestamptz`, and there's a generated `delivery_start_uk timestamp` that materializes the UK wall-clock view for analysts who want it.
+### `_id` counts up, `unit_result_id` is the real identifier
 
-### `_id` is a monotonic cursor, `unit_result_id` is the business key
+- Checked: the row count matches the highest `_id` (both 769,077), and the lowest `_id` is 1 — meaning the IDs count up one at a time, with no gaps.
+- Checked: every `unit_result_id` is unique — no duplicates.
+- Checked: the combination of (unit, product, delivery time) is also unique. That's the exact combination one row of the results table represents.
 
-- Verified: `COUNT(*) = MAX(_id) = 769,077` with `MIN(_id) = 1` — a dense, gapless monotonic sequence at plan time.
-- Verified: `COUNT(DISTINCT unit_result_id) = 769,077`. The business key is unique.
-- Verified: `COUNT(DISTINCT (auction_unit, auction_product, delivery_start)) = 769,077`. That's the fact-table grain.
+### Delivery windows aren't all the same length
 
-### Delivery-window granularity is mixed
+I first assumed every result covered a 30-minute window. Wrong — it depends on the product:
 
-I initially assumed 30-minute windows across the board. The data disagrees:
+- **Response** products (`DCH`, `DCL`, `DMH`, `DML`, `DRH`, `DRL`) → 4-hour blocks (128,968 rows)
+- **Reserve** products (`NBR`, `PBR`, `NQR`, `PQR`, `NSR`, `PSR`) → 30-minute windows (640,109 rows)
 
-- **Response** products (`DCH`, `DCL`, `DMH`, `DML`, `DRH`, `DRL`) → 4-hour EFA blocks (128,968 rows)
-- **Balancing / Quick / Slow Reserve** products (`NBR`, `PBR`, `NQR`, `PQR`, `NSR`, `PSR`) → 30-minute settlement periods (640,109 rows)
+The results table doesn't need to know or care about this difference — since it keys off the exact start time, both kinds of window fit cleanly side by side.
 
-The fact-table grain `(unit, product, delivery_start_utc)` handles both cleanly because `delivery_start_utc` disambiguates them.
+### `auctionProduct` and `serviceType` always match up
 
-### `auctionProduct → serviceType` is 1:1
+Every product maps to exactly one service type, so technically you could always look one up from the other. I still store both, though, because analysts will want to filter by the readable service-type name, not a product code.
 
-Every product maps to exactly one service type. So `serviceType` is derivable from `auctionProduct`, but I still store it on staging and marts because analysts will filter on it more naturally than on the product code.
+### Checked for missing values before locking columns as required
 
-### NOT NULL verified before I locked the constraint
+- `executedQuantity` and `clearingPrice`: zero missing values across 769,077 rows. Safe to require them.
+- `technologyType`: missing ~0.23% of the time → left optional.
+- `postCode`: missing ~14% of the time → left optional.
 
-- `executedQuantity` and `clearingPrice`: 0 nulls across 769,077 rows. Safe to lock `NOT NULL`.
-- `technologyType`: 1,760 nulls (~0.23%) → left nullable.
-- `postCode`: 110,197 nulls (~14%) → left nullable.
+### The price is `£/MW/h`, not `£/MWh`
 
-### Unit label is `£/MW/h`, not `£/MWh`
+`clearingPrice` is what NESO pays for *being available* to deliver a service (pounds per MW of capacity, per hour) — not what NESO pays for *actual energy delivered* (pounds per megawatt-hour). Those are two different things, and getting the label wrong would stand out immediately to anyone who trades energy for a living. The column name spells it out: `clearing_price_gbp_per_mw_h`.
 
-`clearingPrice` is an **availability price** (pounds per MW of capacity per hour), which is not the same thing as an **energy price** (pounds per megawatt-hour). At an energy-trading company, that distinction is instantly spotted. Column name: `clearing_price_gbp_per_mw_h`.
+### Restarting after a failure is safe
 
-### Watermark idempotency
+The highest `_id` already sitting in the raw table is the only thing tracking progress — there's no separate progress file. If a run fails partway through, the downloaded file is still on disk, and the highest `_id` in raw hasn't moved past the rows that failed. Just run extract again — it re-downloads those same rows, and Postgres quietly skips the ones that already made it in.
 
-`raw.max(_id)` is the single source of truth. No separate state file. If a load fails mid-batch, the landing JSONL still exists on disk and `raw.max(_id)` hasn't advanced past the failed rows. Re-running extract will pull those same `_id`s again, and `ON CONFLICT (unit_result_id) DO NOTHING` absorbs the duplicates cleanly.
+### New fields from NESO don't break anything, but don't go unnoticed either
 
-### Schema drift is tolerated silently but visibly
+If NESO adds a new field we don't know about, validation just ignores it instead of crashing — and since raw stores the whole original record anyway, nothing is lost. The validate step does log the first time it sees a new field, though, so a schema change shows up without ever stopping the pipeline.
 
-Pydantic model uses `extra='ignore'`, so new upstream fields don't crash validation — and `raw.payload` JSONB has captured them regardless. The validate runner logs any observed extra keys once per run at INFO level, so drift shows up in the logs without stopping the pipeline.
+### Bad data fails loudly by default
 
----
-
-## 8. Trade-offs I consciously made
-
-- **`schema.sql` over Alembic.** One migration doesn't earn Alembic's setup cost. Called out as the next step when the schema starts evolving.
-- **`psycopg` over SQLAlchemy.** No ORM, no query composition — SQLAlchemy would be a dependency without a job. Explicit SQL is easier to reason about here.
-- **Sync sequential over async concurrency.** ~30 pages × ~700ms is fast enough. Async + semaphore is the scale-up move when a source is throughput-bound or has multiple resources.
-- **`psycopg[binary]` over `[c]`.** Simpler install for reviewers (no system libpq). psycopg's own guidance is `[c]` for prod images.
-- **Reject-threshold defaults to `fail`.** Loud failure over silent degradation. Per-source YAML can soften it to `warn` or `quarantine` when a source has earned trust.
-- **`dim_participant` dropped.** Would have been a degenerate single-column dim carrying only a participant name. Participant is an attribute on `dim_unit` instead.
-- **`raw.payload` as JSONB.** Fine at 770k rows and 200-ish bytes per record. At 1000× volume, JSONB read-cost dominates and I'd move to typed columns + a `raw.audit` JSONB sidecar for drift.
+I'd rather a bad row cause a loud, visible failure than get skipped quietly — by default, even one rejected row marks the whole run as failed, not just a log line nobody reads. This can be relaxed per source (to a warning, or a silent-but-counted "quarantine") once a source has proven itself trustworthy.
 
 ---
 
-## 9. What I would do with more time
+## 8. What I would do with more time
 
 - **Alembic** once the schema starts evolving beyond one migration.
-- **dbt** for the marts layer — turn the numbered SQL files into models with tests.
-- **Prefect or Dagster** for orchestration — the CLI is orchestrator-agnostic on purpose, so wrapping it is a small task.
-- **Great Expectations** for richer data-quality assertions beyond pydantic.
+- **Prefect or Dagster** for scheduling runs — the CLI doesn't depend on any particular scheduler, so plugging one in later is a small task.
+- **Great Expectations** for deeper data-quality checks beyond what pydantic covers.
 - **A small Grafana dashboard** over `ops.pipeline_runs` and `ops.freshness`.
-- **Explicit backfill flags:** `--from-id` / `--to-id` on extract for bounded historical replays.
-- **testcontainers** for real integration tests instead of the `@pytest.mark.db` skip pattern.
-- **SCD Type 2 on `dim_unit`** if participant or postcode ever changes for a unit.
+- **testcontainers**, so database tests spin up a real throwaway database instead of just skipping when one isn't available.
+- **Keep a history of changes to `dim_unit`** (a technique called SCD Type 2) if a unit's participant or postcode ever changes and we want to know what it used to be.
 
 ---
 
-## 10. What I would change at 1000× volume, backfill, or more sources
+## 9. What I would change at 1000× volume, backfill, or more sources
 
-- **Landing:** local JSONL → S3 with gzip. Immutable object-store raw landing.
-- **Partitioning:** `raw` and `staging` by month of `delivery_start_utc`. Cheaper reads, cheaper deletes, obvious backfill boundaries.
-- **Concurrency:** async httpx with bounded `_id` ranges across workers. `_id` is monotonic and dense, which makes range-parallelism trivial.
-- **Raw shape:** drop `raw.payload` JSONB in favor of typed raw columns + a slimmer `raw.audit` JSONB sidecar for schema-drift capture. JSONB read cost stops being negligible.
-- **Transforms:** move to dbt incremental models. The numbered `.sql` files are a stepping stone.
-- **Marts to a warehouse:** Snowflake / BigQuery / Redshift for the analytical layer once query concurrency grows.
-- **Backfill:** bounded `--from-id` / `--to-id` on extract, parallelised across workers, checkpointed per range.
+- **Landing:** save downloaded files to cloud storage (e.g. S3), compressed, instead of local disk.
+- **Partitioning:** split `raw` and `staging` by month. Faster reads, cheaper deletes, and a natural boundary for reprocessing a specific time range.
+- **Concurrency:** since IDs count up with no gaps, it's easy to split a big download into ID ranges and pull them in parallel across multiple workers instead of one at a time.
+- **Raw shape:** switch from one big JSON blob per row to proper typed columns, plus a much smaller JSON column just for catching new fields NESO adds later. Reading JSON gets expensive at this size.
+- **Transforms:** rebuild the marts tables incrementally instead of from scratch every run, using dbt. The current numbered SQL files are a reasonable first step, not the end state.
+- **Marts to a warehouse:** move the analyst-facing tables to something like Snowflake, BigQuery, or Redshift once many people are querying at once.
+- **Backfill:** add flags to pull a specific ID range on demand, split across workers, with progress saved per range in case one fails partway through.
 
 ---
 
-## 11. Known limitations
+## 10. Known limitations
 
-- No full end-to-end integration test. The DB-touching tests cover load-raw idempotency and schema smoke; validation and extract are covered offline.
+- There's no single test that runs the whole pipeline start to finish against a real database. The database tests check that loading is safe to repeat and that the schema builds correctly; validation and extracting are tested separately, without a real database.
 - No dashboard — SQL queries against `ops.*` are the interface.
-- Timezone verification is empirical (via EFA-boundary alignment). I would formally confirm against NESO metadata before shipping this.
-- Single-node pipeline. No horizontal scale-out.
-- The `RestApiCursorExtractor` is a documented skeleton, not a working extractor. That's deliberate — see §6.
+- The timezone assumption is backed by evidence, not an official source — I'd confirm it properly with NESO before fully trusting it.
+- Runs on one machine. Can't currently spread the work across several.
+- The example non-CKAN extractor doesn't actually work yet — it's meant to prove the shape of the interface, not to be used for real. That's intentional; see §6.
 
 ---
 
-## 12. Review pass — verification and fixes
+## 11. Review pass — verification and fixes
 
-Total time on this submission: ~3 hours. The last stretch was a review pass using agentic tooling (Claude Code): running the pipeline against the live API at full volume (776,936 rows, zero rejects, grain assertion holding), fixing a handful of real bugs it surfaced along the way (a couple of Docker/Compose issues, a test-isolation gap, some SQL-composition inconsistencies), and adding the architecture diagrams above. Every fix is covered by the existing test suite and was re-verified against a live full-scale run afterward.
+Total time on this submission: about 3 hours. The last part was a review pass using AI tooling (Claude Code) — running the pipeline against the real API at its current full size (776,936 rows — up from the 769,077 in §7, since NESO's feed keeps growing — zero rejected, no duplicate rows), fixing a few real bugs it found along the way (some Docker setup issues, a test that wasn't properly isolated from other data, a couple of inconsistencies in how SQL was built), and adding the diagrams above. Every fix is covered by the test suite and was checked again against a full live run afterward.
