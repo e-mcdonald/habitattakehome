@@ -41,7 +41,7 @@ flowchart LR
     TR -. run row .-> OPS
 ```
 
-**In plain terms:** ① **Extract** asks NESO's API for anything newer than what we've already stored and saves it to a plain text file. ② **Load raw** copies that file into Postgres exactly as received — nothing is cleaned or interpreted yet; this is our permanent, unedited copy of what NESO actually said. ③ **Validate** checks each record against a strict shape (right fields present, numbers are numbers, dates parse) — records that pass move into a clean `staging` table with proper types; anything that fails is logged separately without breaking the rest of the batch. ④ **Transform** reshapes the validated data into two simple, analyst-friendly tables: one row per battery/asset, one row per accepted auction result.
+**Flow:** ① **Extract** asks NESO's API for anything newer than what we've already stored and saves it to a plain text file. ② **Load raw** copies that file into Postgres exactly as received — nothing is cleaned or interpreted yet; this is our permanent, unedited copy of what NESO actually said. ③ **Validate** checks/cleans each record against a strict shape (right fields present, numbers are numbers, dates parse) — records that pass move into a clean `staging` table with proper types; anything that fails is logged separately without breaking the rest of the batch. ④ **Transform** reshapes the validated data into two simple, analyst-friendly tables: one row per battery/asset, one row per accepted auction result.
 
 Every stage is safe to re-run on its own — running it twice doesn't duplicate or corrupt anything. There's no separate file tracking progress: the watermark is read straight out of Postgres (`raw.max(_id)`), so "how far have we gotten" always has one unambiguous answer.
 
@@ -49,9 +49,9 @@ Every stage is safe to re-run on its own — running it twice doesn't duplicate 
 
 Everything else here is downstream of three calls made before writing any pipeline code.
 
-**1. Raw lands before anything validates it, and is never mutated afterward.** The order is `extract → load raw → validate → transform`, not `extract → validate → load`. If a bad row got filtered out before it ever reached storage, we'd move past its ID and never see it again — silent data loss. Raw-first means a validation bug is a same-day fix (re-run `validate` against data already sitting in Postgres) instead of a re-download against a source with no uptime guarantee.
+**1. Raw lands before anything validates it, and is never mutated afterward.** The order is `extract → load raw → validate → transform`, not `extract → validate → load`. If a bad row got filtered out before it ever reached storage, we'd move past its ID and never see it again, which causes silent data loss. Raw-first means a validation bug is a same-day fix (re-run `validate` against data already sitting in Postgres) instead of a re-download against a source with no uptime guarantee.
 
-**2. `unit_result_id`, not NESO's own `_id`, is the identity everything hangs off — and there's no separate progress file.** CKAN (NESO's data platform) can reissue `_id` if a resource ever reloads — a known platform quirk, not a hypothetical. Using it as the dedup key would risk silently dropping real rows via `ON CONFLICT ... DO NOTHING`. `unit_result_id` is NESO's own business key, verified unique across the full dataset before relying on it. And since the watermark is just `MAX(_id)` read live from `raw`, there's no checkpoint file that can drift out of sync with what's actually in the database — a failed run's only recovery step is "run it again."
+**2. `unit_result_id`, not NESO's own `_id`, is the identity everything hangs off, and there's no separate progress file.** CKAN (NESO's data platform) can reissue `_id` if a resource ever reloads, which is a platform quirk. Using it as the dedup key would risk silently dropping real rows via `ON CONFLICT ... DO NOTHING`. `unit_result_id` is NESO's own business key, verified unique across the full dataset before relying on it. And since the watermark is just `MAX(_id)` read live from `raw`, there's no checkpoint file that can drift out of sync with what's actually in the database — a failed run's only recovery step is "run it again."
 
 **3. Sources are config, not code.** The brief says outright: *"This may not be the only dataset we ingest from NESO, nor is NESO our only ingestion source, so structure your code with that in mind."* A `Source` is a YAML file plus a pydantic model; an `Extractor` is a small `Protocol` looked up by name from a registry. Adding a same-API-family source touches zero runner code — proven by `sources/neso_second_dataset.yaml`, a working config-only stub. A non-CKAN source is a new class plus one decorator — proven by `sources/rest.py`, a narrated skeleton for a cursor-paginated REST API.
 
@@ -171,7 +171,6 @@ GROUP BY reason;
 
 ## 4. What I'd improve with more time
 
-- **Alembic**, once the schema evolves past one migration.
 - **dbt** for the marts layer — the numbered SQL files are a reasonable first step, not the end state, especially once transforms need to be incremental.
 - **Prefect or Dagster** for scheduling — the CLI doesn't assume any particular scheduler, so this is a small wrapper, not a redesign.
 - **Great Expectations** for data-quality checks deeper than what pydantic covers.
@@ -186,11 +185,9 @@ GROUP BY reason;
 - **Raw shape:** typed columns instead of one JSONB blob per row, with a much smaller JSON column reserved for genuinely new/unexpected fields — reading JSON gets expensive at this size.
 - **Transforms:** incremental dbt models instead of rebuilding marts from the full staging table every run.
 - **Marts:** move analyst-facing tables to a warehouse (Snowflake/BigQuery/Redshift) once concurrent query load matters.
-- **Backfill specifically:** add an explicit `--from-id`/`--to-id` range flag, with per-range progress tracked so a partial backfill failure doesn't require restarting the whole thing.
 
 ## 6. Other assumptions and decisions
 
 - **Timezone: NESO's naive timestamps are UTC.** Not documented anywhere by NESO, so this was checked empirically: the earliest `deliveryStart` in the dataset reads `22:00`, and only lines up with the canonical 23:00 EFA-block start time if read as UTC on a date the UK was on BST (23:00 BST = 22:00 UTC). Read as UK local time, the same value would be `23:00`, not `22:00` — so UTC is the reading that's actually internally consistent. Limitation: the dataset doesn't span a clock-change boundary, so this can't be cross-checked against a spring-forward/fall-back date — I'd confirm formally against NESO's own documentation given more time.
 - **Delivery windows aren't a fixed width.** Response products run 4-hour EFA blocks; Reserve products run 30-minute settlement periods. The fact table's grain doesn't care, since it keys off the exact `delivery_start_utc` rather than an assumed slot width — but it was worth checking rather than assuming.
-- **`executed_quantity_mw` and `clearing_price_gbp_per_mw_h` are `NOT NULL`; `technology_type` and `post_code` are nullable** — not a guess. Checked null rates directly against the full dataset first (0% for the required two, ~0.23% and ~14% respectively for the other two) before locking the constraint either way.
-- **AI tooling disclosure:** used throughout the build, plus a dedicated review pass that caught and fixed real issues (a Docker entrypoint problem, a test-isolation gap, a couple of SQL inconsistencies) — all covered by tests. Before submission, the entire environment was rebuilt from a wiped Docker volume and every documented command re-run cold: schema migration, offline demo, live small-batch demo, a full live extract of the current dataset (784,655 rows, up from 769,077 at initial build — the feed keeps growing daily), a second full run proving idempotency (zero rows moved on the re-run), full test suite (16/16 passing), and `ruff`/`mypy --strict` clean. I'm accountable for all of it, which is the standard the brief itself asks for.
+- **`executed_quantity_mw` and `clearing_price_gbp_per_mw_h` are `NOT NULL`; `technology_type` and `post_code` are nullable**. Checked null rates directly against the full dataset first (0% for the required two, ~0.23% and ~14% respectively for the other two) before locking the constraint either way.
