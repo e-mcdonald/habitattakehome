@@ -7,7 +7,7 @@ that comes out of a validated model is nearly ready to insert into staging.
 Timezone: NESO's naive ISO strings are UTC. Verified empirically — the min
 ``deliveryStart`` of ``2026-03-31 22:00`` naive aligns with 23:00 BST, which is
 the canonical EFA-block start. Under a local-time reading it would be 23:00,
-not 22:00. See NOTES §8 for the full argument.
+not 22:00. See NOTES §6 for the full argument.
 """
 
 from __future__ import annotations

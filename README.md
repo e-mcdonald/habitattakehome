@@ -19,7 +19,7 @@ docker compose up -d postgres
 # One-time schema init
 docker compose run --rm pipeline migrate
 
-# ~30 second live demo (5000 rows through the full pipeline)
+# Live demo (~5-10s): 5000 rows through the full pipeline
 docker compose run --rm pipeline run --source neso_dfr_results --all --limit 5000
 
 # No-network demo (uses tests/fixtures/sample_records.json)

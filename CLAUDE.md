@@ -29,7 +29,7 @@ A Python data pipeline that ingests NESO DFR auction results into Postgres via *
 ## Testing conventions
 
 - Use `respx` for HTTP mocking. Never hit the live NESO API in tests.
-- Mark tests that need a live Postgres with `@pytest.mark.db`. They skip when `DATABASE_URL` is unset. Run inside compose via `docker compose run --rm pipeline pytest -m "db or not db"`.
+- Mark tests that need a live Postgres with `@pytest.mark.db`. They skip when `DATABASE_URL` is unset. Run inside compose via the dedicated `test` service (not `pipeline` — the runtime image doesn't ship pytest or dev deps): `docker compose run --rm test -m "db or not db"`, or `make test`.
 - Fixtures in `tests/fixtures/` also power `habitat-pipeline demo-offline`. Keep them small (< 1000 rows).
 - If `test_schema_smoke.py` fails, `sql/schema.sql` has a typo. Do not "fix" the test to make the schema error pass.
 
@@ -43,13 +43,11 @@ A Python data pipeline that ingests NESO DFR auction results into Postgres via *
 
 ## Decisions and reasoning — pointer index into NOTES.md
 
-- Storage / model / library choices → NOTES §3
-- Why raw/staging/marts split, raw-first ordering → NOTES §5
-- Observability model → NOTES §6
-- Extensibility abstraction → NOTES §7
-- Assumptions & evidence (timezone, nulls, grain) → NOTES §8
-- Trade-offs consciously made → NOTES §9
-- Scaling story (1000×, backfill, more sources) → NOTES §11
+- Why raw-first ordering, why `unit_result_id` not `_id`, why extensibility is config-driven → NOTES, "The three decisions that matter most"
+- Storage / data model / library choices (incl. trade-offs) → NOTES §2
+- Observability model, reject handling → NOTES §3
+- Assumptions & evidence (timezone, delivery windows, nulls) → NOTES §6
+- Scaling story (1000×, backfill, more sources) → NOTES §5
 
 ## What NOT to add without discussion
 

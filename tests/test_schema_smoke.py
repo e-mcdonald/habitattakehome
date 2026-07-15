@@ -1,9 +1,10 @@
 """Schema smoke test — proves sql/schema.sql applies cleanly.
 
 Catches SQL typos before a reviewer does, including the ``delivery_start_uk``
-generated-column type (see NOTES.md §4 — Postgres silently accepts
-``timestamptz`` here and computes a session-dependent, wrong value instead of
-rejecting it, so the type itself has to be asserted directly). Marked
+generated-column type (see the comment above that column in sql/schema.sql —
+Postgres silently accepts ``timestamptz`` here and computes a session-dependent,
+wrong value instead of rejecting it, so the type itself has to be asserted
+directly). Marked
 ``@pytest.mark.db`` — needs a live Postgres; the ``clean_db`` fixture resets to
 an empty schema first so this doesn't clobber (or get clobbered by) an
 in-progress database.
@@ -56,5 +57,5 @@ def test_schema_applies_and_core_objects_exist(clean_db: str) -> None:
         assert is_generated == "ALWAYS"
         assert data_type == "timestamp without time zone", (
             f"delivery_start_uk must stay a naive timestamp, got {data_type!r} — "
-            "see NOTES.md §4 for why timestamptz silently computes the wrong value"
+            "see sql/schema.sql for why timestamptz silently computes the wrong value"
         )
