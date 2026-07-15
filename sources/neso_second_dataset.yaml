@@ -10,6 +10,13 @@
 # No changes to any runner would be needed. The core task's own brief flags
 # extensibility ("this may not be the only dataset we ingest from NESO"), and
 # this file exists to demonstrate that the runner is source-agnostic.
+#
+# Note: resource_id below is also a placeholder, so actually running this
+# source (--stage extract or --all) fails at the extract stage with a real
+# CKAN "resource not found" error before validation is ever reached — not
+# with a clean pydantic refusal. The unimplemented model below is what would
+# reject every row once a real resource_id is wired in; it isn't itself what
+# blocks a run today.
 
 name: neso_second_dataset
 extractor: ckan_datastore_sql
@@ -22,8 +29,9 @@ extractor_config:
   inter_page_sleep_seconds: 0.2
   request_timeout_seconds: 30
 
-# Model not implemented; the CLI will refuse to run this source until the model
-# is added. That refusal is the point — it proves the config layer is complete.
+# Deliberately unimplemented (extra="forbid", no fields) — would reject every
+# row once a real resource_id is in place, proving validation is a per-source
+# contract rather than shared runner logic.
 schema_model: habitat_pipeline.validate.models.NesoSecondDatasetPlaceholder
 raw_table: raw.neso_second_dataset
 staging_table: staging.neso_second_dataset
